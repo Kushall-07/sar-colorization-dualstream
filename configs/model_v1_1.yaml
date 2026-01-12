@@ -1,0 +1,136 @@
+# configs/model_v1_1.yaml
+contract_version: "1.1"
+
+io:
+  image_size:
+    H: 256
+    W: 256
+  sar_channels: 1
+  rgb_channels: 3
+  output_range: "[0,1]"
+  confidence_range: "[0,1]"
+
+preprocessing:
+  sar_domain: "dB"                # defined: SAR is provided/converted to dB before normalization
+  normalization:
+    type: "percentile_minmax"
+    percentiles: [2.0, 98.0]      # clip to p2..p98 then scale to [0,1]
+    eps: 1.0e-6
+
+vit:
+  patch_size: 16                   # 256/16 = 16 patches per side => 256 tokens
+  embed_dim: 512
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.1
+  attn_dropout: 0.0
+  pre_norm: true
+
+stream_a:
+  depth: 12
+  in_chans: 1
+  add_cls_token: false             # we use patch tokens only
+  positional_encoding: "learned"   # learned 2D or flattened learned
+
+stream_b_prior:
+  design: "hybrid"                 # fixed base + SAR-conditioned offset
+  num_prior_tokens: 256            # NP, matches patch token count
+  embed_dim: 512
+
+  fixed_bank:
+    init: "learned"                # trainable parameters initialized (e.g., truncated normal)
+    shared_across_batch: true       # base bank is (1,NP,D)
+
+  conditional_offset:
+    enabled: true
+    # prior generator takes global SAR stats and produces an offset added to fixed bank
+    features: ["mean", "std", "p10", "p50", "p90"]  # computed on normalized SAR
+    hidden_dim: 256
+    num_layers: 2
+    activation: "gelu"
+    out_scale: 0.1                 # small offset magnitude to prevent instability
+
+fusion:
+  type: "cross_attention"
+  num_layers: 2
+  num_heads: 8
+  dropout: 0.1
+  # queries from stream A, keys/values from prior tokens
+  qkv_bias: true
+
+decoder:
+  type: "transformer_upsample"
+  depth: 6
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.1
+
+  upsample_head:
+    type: "conv_upsample"          # token->feature map then conv upsampling
+    # token grid is (16x16). Convert tokens->(B,D,16,16) then upsample to 256x256.
+    stages:
+      - {scale: 2, out_channels: 256}
+      - {scale: 2, out_channels: 128}
+      - {scale: 2, out_channels: 64}
+      - {scale: 2, out_channels: 32}
+    final_conv:
+      rgb_out_channels: 3
+      conf_out_channels: 1
+    conf_activation: "sigmoid"     # enforce [0,1]
+    rgb_activation: "sigmoid"      # enforce [0,1]
+
+loss:
+  weights:
+    lambda_color: 1.0
+    lambda_structure: 0.5
+    lambda_palette: 0.1
+    lambda_confidence: 0.2
+
+  color:
+    space: "Lab"
+    type: "L1"
+    eps: 1.0e-6
+
+  structure:
+    # SAR-guided: compare SAR gradients with predicted luminance gradients
+    gradient:
+      type: "charbonnier"
+      epsilon: 1.0e-3
+      smoothing:
+        enabled: true
+        kernel: "gaussian"
+        sigma: 1.0
+    multiscale:
+      enabled: true
+      scales: [1, 2, 4]            # downsample factors
+
+  palette:
+    method: "VQ_codebook"
+    codebook_size: 64              # K
+    space: "Lab"
+    commitment_weight: 0.25
+    use_soft_assign: true
+    temperature: 1.0
+
+  confidence:
+    target_mapping: "exp"
+    # tau is set from a calibration batch statistic, not hardcoded as a magic number.
+    tau:
+      type: "robust_stat"
+      stat: "median"               # tau := median(err_lab) over calibration batch
+      min_tau: 1.0e-3
+    loss_type: "L1"
+    detach_target: true            # conf_target computed from error should not backprop into rgb via conf loss
+
+verification:
+  assert_shapes: true
+  assert_ranges: true
+  forward_one_batch: true
+  overfit_sanity:
+    enabled: true
+    num_samples: 5
+    max_steps: 200
+  confidence_check:
+    enabled: true
+    metric: "spearman"             # monotonic correlation
+    expect: "negative"
